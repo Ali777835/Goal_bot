@@ -1,0 +1,14 @@
+{
+  "name": "goal-challenge-bot",
+  "version": "1.0.0",
+  "description": "ربات Goal Challenge",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.12.2",
+    "sqlite3": "^5.1.6",
+    "dotenv": "^16.0.3"
+  }
+}
