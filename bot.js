@@ -10,8 +10,8 @@ const { Telegraf } = require('telegraf');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
-const TOKEN = process.env.BOT_TOKEN || 'TOKEN_ربات_خودتون_رو_اینجا_بذارید';
-const ADMIN_ID = parseInt(process.env.ADMIN_ID || '0'); // آیدی عددی مدیر
+const TOKEN = process.env.BOT_TOKEN || '7980096496:AAEza-CUFjxG-e6u2Y-NJkgJUK4i73dg3iY';
+const ADMIN_ID = parseInt(process.env.ADMIN_ID || '7744236569'); // آیدی عددی مدیر
 const DAILY_BONUS = 50; // مقدار هدیه‌ی روزانه
 const WIN_BONUS_TRANSFER_ID = null; // (رزرو برای توسعه‌های بعدی)
 
