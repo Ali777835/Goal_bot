@@ -1,0 +1,715 @@
+// ==============================
+// ربات بازی تلگرامی (نسخه‌ی رایگان - بدون پرداخت واقعی)
+// ==============================
+// قبل از اجرا:
+// 1) npm install telegraf sqlite3
+// 2) متغیرهای TOKEN و ADMIN_ID رو پایین‌تر با مقادیر خودتون پر کنید
+//    (یا با متغیر محیطی ست کنید: BOT_TOKEN و ADMIN_ID)
+
+const { Telegraf } = require('telegraf');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
+
+const TOKEN = process.env.BOT_TOKEN || '7980096496:AAEza-CUFjxG-e6u2Y-NJkgJUK4i73dg3iY';
+const ADMIN_ID = parseInt(process.env.ADMIN_ID || '7744236569'); // آیدی عددی مدیر
+const DAILY_BONUS = 50; // مقدار هدیه‌ی روزانه
+const WIN_BONUS_TRANSFER_ID = null; // (رزرو برای توسعه‌های بعدی)
+
+const bot = new Telegraf(TOKEN);
+
+// ------------------------------
+// دیتابیس
+// ------------------------------
+const dbPath = path.join(__dirname, 'data.db');
+const db = new sqlite3.Database(dbPath);
+
+db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        diamonds INTEGER DEFAULT 0,
+        last_daily INTEGER DEFAULT 0
+    )
+`);
+
+function getUser(userId, callback) {
+    db.get('SELECT * FROM users WHERE user_id = ?', [userId], (_err, row) => {
+        if (!row) {
+            db.run('INSERT INTO users (user_id, diamonds) VALUES (?, 0)', [userId], () => {
+                db.get('SELECT * FROM users WHERE user_id = ?', [userId], (_e, newRow) => callback(newRow));
+            });
+        } else {
+            callback(row);
+        }
+    });
+}
+
+function updateUser(userId, data, callback) {
+    const keys = Object.keys(data);
+    const values = Object.values(data);
+    const setClause = keys.map((k) => `${k} = ?`).join(', ');
+    db.run(`UPDATE users SET ${setClause} WHERE user_id = ?`, [...values, userId], callback || (() => {}));
+}
+
+// ------------------------------
+// منوی اصلی
+// ------------------------------
+function mainMenuKeyboard() {
+    return {
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '💎 درخواست الماس', callback_data: 'request_diamonds' }],
+                [{ text: '👤 حساب کاربری', callback_data: 'account' }],
+                [{ text: '📩 پیشنهاد بازی', callback_data: 'suggest' }],
+                [{ text: '🎮 بازی', callback_data: 'game' }]
+            ]
+        }
+    };
+}
+
+function mainMenuText(name, diamonds) {
+    return `سلام ${name} 👋\nبه ربات بازی خوش اومدی!\nموجودی فعلیت: 💎 ${diamonds}\n\nیکی از دکمه‌های پایین رو بزن:`;
+}
+
+// ------------------------------
+// استارت در خصوصی / گروه
+// ------------------------------
+bot.start((ctx) => {
+    const userId = ctx.from.id;
+    const name = ctx.from.first_name || 'رفیق';
+    const chatType = ctx.chat.type;
+
+    if (chatType === 'group' || chatType === 'supergroup') {
+        ctx.getChatMember(ctx.botInfo.id).then((botMember) => {
+            if (botMember.status === 'administrator' || botMember.status === 'creator') {
+                ctx.reply(
+                    'سلاااام به بچه‌های گروه 😄\nیه توضیح کوتاه بدم که بدونید بازی چجوریه:\n\n' +
+                    '🎮 بازی شرط‌بندی با الماس\n' +
+                    'برای بازی با یه نفر دیگه بنویس مثلاً: بازی 20\n' +
+                    'برای بازی با خود ربات بنویس: بازی 20 با ربات\n\n' +
+                    'موفق باشید! 🍀'
+                );
+            } else {
+                ctx.reply('❌ لطفاً اول ربات رو ادمین گروه کنید تا فعال بشه.');
+            }
+        });
+        return;
+    }
+
+    getUser(userId, (user) => {
+        ctx.reply(mainMenuText(name, user.diamonds), mainMenuKeyboard());
+    });
+});
+
+bot.action('back', (ctx) => {
+    const userId = ctx.from.id;
+    const name = ctx.from.first_name || 'رفیق';
+    getUser(userId, (user) => {
+        ctx.editMessageText(mainMenuText(name, user.diamonds), mainMenuKeyboard()).catch(() => {
+            ctx.reply(mainMenuText(name, user.diamonds), mainMenuKeyboard());
+        });
+    });
+});
+
+// ------------------------------
+// درخواست الماس رایگان (با کیبورد عددی)
+// ------------------------------
+const requestTemp = {}; // userId -> رشته عدد در حال تایپ
+
+function numpadKeyboard() {
+    return {
+        reply_markup: {
+            inline_keyboard: [
+                ['1', '2', '3'],
+                ['4', '5', '6'],
+                ['7', '8', '9'],
+                ['✓', '0', '×']
+            ].map((row) => row.map((v) => ({ text: v, callback_data: `req_num_${v}` })))
+        }
+    };
+}
+
+function numpadText(display) {
+    return `چند تا الماس می‌خوای درخواست بدی؟\nعدد مورد نظرت رو با دکمه‌های پایین وارد کن.\nمقدار فعلی: ${display}`;
+}
+
+bot.action('request_diamonds', (ctx) => {
+    requestTemp[ctx.from.id] = '';
+    ctx.editMessageText(numpadText('0'), numpadKeyboard()).catch(() => {
+        ctx.reply(numpadText('0'), numpadKeyboard());
+    });
+});
+
+bot.action(/^req_num_(.+)$/, (ctx) => {
+    const userId = ctx.from.id;
+    const val = ctx.match[1];
+    const current = requestTemp[userId] || '';
+
+    if (val === '✓') {
+        const amount = parseInt(current);
+        if (!amount || amount <= 0) {
+            return ctx.answerCbQuery('❌ اول یه عدد معتبر وارد کن!', { show_alert: true });
+        }
+        if (!ADMIN_ID) {
+            return ctx.answerCbQuery('⚠️ ادمین هنوز تنظیم نشده.', { show_alert: true });
+        }
+
+        delete requestTemp[userId];
+        const name = ctx.from.first_name || 'یه کاربر';
+
+        ctx.editMessageText(
+            `درخواستت (${amount} 💎) به مدیر ارسال شد.\nمنتظر بمون تا تایید کنه 🙏`
+        ).catch(() => {
+            ctx.reply(`درخواستت (${amount} 💎) به مدیر ارسال شد.\nمنتظر بمون تا تایید کنه 🙏`);
+        });
+
+        ctx.telegram.sendMessage(
+            ADMIN_ID,
+            `📩 درخواست الماس جدید\n\n👤 نام: ${name}\n🆔 آیدی: ${userId}\n💎 مقدار درخواستی: ${amount}\n\nتاییدش می‌کنی؟`,
+            {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '✅ میدم', callback_data: `req_accept_${userId}_${amount}` }],
+                        [{ text: '❌ نمیدم', callback_data: `req_reject_${userId}` }]
+                    ]
+                }
+            }
+        );
+        return;
+    }
+
+    if (val === '×') {
+        requestTemp[userId] = current.slice(0, -1);
+    } else {
+        if (current.length >= 6) return; // جلوگیری از عدد خیلی بزرگ
+        requestTemp[userId] = current + val;
+    }
+
+    const display = requestTemp[userId] || '0';
+    ctx.editMessageText(numpadText(display), numpadKeyboard()).catch(() => {});
+});
+
+bot.action(/^req_accept_(\d+)_(\d+)$/, (ctx) => {
+    const userId = parseInt(ctx.match[1]);
+    const amount = parseInt(ctx.match[2]);
+
+    getUser(userId, (user) => {
+        updateUser(userId, { diamonds: user.diamonds + amount }, () => {
+            ctx.editMessageText(`✅ تایید شد. ${amount} 💎 به کاربر ${userId} اضافه شد.`).catch(() => {});
+            ctx.telegram.sendMessage(userId, `🎉 مدیر لطف کرد و ${amount} 💎 بهت اضافه کرد!`);
+        });
+    });
+});
+
+bot.action(/^req_reject_(\d+)$/, (ctx) => {
+    const userId = parseInt(ctx.match[1]);
+    ctx.editMessageText('❌ رد شد.').catch(() => {});
+    ctx.telegram.sendMessage(userId, '😅 مدیر این بار رد کرد، یه وقت دیگه امتحان کن.');
+});
+
+// ------------------------------
+// حساب کاربری
+// ------------------------------
+bot.action('account', (ctx) => {
+    const userId = ctx.from.id;
+    getUser(userId, (user) => {
+        ctx.editMessageText(
+            `👤 حساب کاربری\n\n🆔 آیدی: ${userId}\n💎 تعداد الماس: ${user.diamonds}`,
+            { reply_markup: { inline_keyboard: [[{ text: '🔙 برگشت', callback_data: 'back' }]] } }
+        ).catch(() => {});
+    });
+});
+
+// ------------------------------
+// پیشنهاد بازی
+// ------------------------------
+const awaitingSuggestion = new Set();
+
+bot.action('suggest', (ctx) => {
+    awaitingSuggestion.add(ctx.from.id);
+    ctx.editMessageText('بازی پیشنهادیت رو بنویس، می‌خونمش 😊').catch(() => {
+        ctx.reply('بازی پیشنهادیت رو بنویس، می‌خونمش 😊');
+    });
+});
+
+// ------------------------------
+// افزودن به گروه
+// ------------------------------
+bot.action('game', (ctx) => {
+    ctx.editMessageText(
+        '🎮 بازی‌های فعلی\n\n⭕ دوز 2 نفره\n🎲 شرط‌بندی\n\nبرای بازی کردن باید ربات رو داخل گروهت ادمین کنی.',
+        {
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '⭕ دوز 2 نفره', callback_data: 'info_doz' }],
+                    [{ text: '🎲 شرط‌بندی', callback_data: 'info_bet' }],
+                    [{ text: '➕ افزودن به گروه', url: `https://t.me/${ctx.botInfo.username}?startgroup=new` }],
+                    [{ text: '🔙 برگشت', callback_data: 'back' }]
+                ]
+            }
+        }
+    ).catch(() => {});
+});
+
+bot.action('info_doz', (ctx) => {
+    ctx.answerCbQuery();
+    ctx.reply('⭕ برای شروع بازی دوز داخل گروه بنویس:\nدوز <مقدار الماس>\nمثال: دوز 20');
+});
+
+bot.action('info_bet', (ctx) => {
+    ctx.answerCbQuery();
+    ctx.reply('🎲 برای شروع بازی شرط‌بندی داخل گروه بنویس:\nبازی <مقدار الماس>\nیا برای بازی با ربات:\nبازی <مقدار الماس> با ربات');
+});
+
+// ------------------------------
+// متن‌های آزاد (پیام خصوصی)
+// ------------------------------
+bot.on('text', (ctx, next) => {
+    const userId = ctx.from.id;
+    const text = ctx.message.text;
+
+    if (ctx.chat.type === 'private' && awaitingSuggestion.has(userId)) {
+        awaitingSuggestion.delete(userId);
+        ctx.reply('باشه، فرستادم پیش مدیر. نتیجه رو بهت می‌گم 👌');
+
+        if (ADMIN_ID) {
+            ctx.telegram.sendMessage(
+                ADMIN_ID,
+                `📩 پیشنهاد بازی جدید\n\n👤 کاربر: ${userId}\n📝 متن: ${text}`,
+                {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: '✅ تایید', callback_data: `suggest_accept_${userId}` }],
+                            [{ text: '❌ رد', callback_data: `suggest_reject_${userId}` }]
+                        ]
+                    }
+                }
+            );
+        }
+        return;
+    }
+
+    return next();
+});
+
+bot.action(/^suggest_accept_(\d+)$/, (ctx) => {
+    const userId = parseInt(ctx.match[1]);
+    ctx.editMessageText('✅ تایید شد.').catch(() => {});
+    ctx.telegram.sendMessage(userId, '🎉 پیشنهادت تایید شد، ایده‌ی خوبی بود!');
+});
+
+bot.action(/^suggest_reject_(\d+)$/, (ctx) => {
+    const userId = parseInt(ctx.match[1]);
+    ctx.editMessageText('❌ رد شد.').catch(() => {});
+    ctx.telegram.sendMessage(userId, '😅 این بار پیشنهادت قبول نشد، یه بار دیگه امتحان کن.');
+});
+
+// ------------------------------
+// بازی گروهی (کاربر با کاربر)
+// ------------------------------
+const games = {};
+const MIN_BET = 20;
+
+bot.hears(/^بازی (\d+)$/, (ctx) => {
+    const userId = ctx.from.id;
+    const amount = parseInt(ctx.match[1]);
+
+    if (ctx.chat.type === 'private') return ctx.reply('❌ بازی فقط داخل گروه انجام می‌شه.');
+    if (amount < MIN_BET) return ctx.reply(`❌ حداقل شرط ${MIN_BET} الماسه.`);
+
+    getUser(userId, (user) => {
+        if (user.diamonds < amount) return ctx.reply(`❌ الماس کافی نداری. موجودی: ${user.diamonds}`);
+
+        updateUser(userId, { diamonds: user.diamonds - amount }, () => {
+            const gameId = `${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+            games[gameId] = { creator: userId, amount, prize: amount * 2, players: [userId], status: 'waiting' };
+
+            ctx.reply(
+                `🏆 بازی جدید\n\n👤 بازیکن اول: ${userId}\n🎁 جایزه‌ی برنده: ${amount * 2} 💎\n\nبرای پیوستن دکمه رو بزن:`,
+                {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: '➕ پیوستن', callback_data: `join_${gameId}` }],
+                            [{ text: '❌ لغو', callback_data: `cancel_${gameId}` }]
+                        ]
+                    }
+                }
+            );
+        });
+    });
+});
+
+bot.action(/^join_([\w]+)$/, (ctx) => {
+    const gameId = ctx.match[1];
+    const userId = ctx.from.id;
+    const game = games[gameId];
+
+    if (!game) return ctx.answerCbQuery('❌ این بازی دیگه وجود نداره.', { show_alert: true });
+    if (game.status !== 'waiting') return ctx.answerCbQuery('❌ بازی تموم شده.', { show_alert: true });
+    if (game.creator === userId) return ctx.answerCbQuery('❌ نمی‌تونی به بازی خودت بپیوندی.', { show_alert: true });
+    if (game.players.includes(userId)) return ctx.answerCbQuery('❌ قبلاً پیوستی.', { show_alert: true });
+
+    getUser(userId, (user) => {
+        if (user.diamonds < game.amount) {
+            return ctx.answerCbQuery(`❌ الماس کافی نداری. موجودی: ${user.diamonds}`, { show_alert: true });
+        }
+
+        updateUser(userId, { diamonds: user.diamonds - game.amount }, () => {
+            game.players.push(userId);
+            game.status = 'complete';
+
+            ctx.editMessageText(
+                `🏆 بازی\n\n👤 بازیکن اول: ${game.players[0]}\n👤 بازیکن دوم: ${game.players[1]}\n\n🔄 در حال مشخص شدن برنده...`
+            ).catch(() => {});
+
+            setTimeout(() => {
+                const winner = game.players[Math.floor(Math.random() * game.players.length)];
+                const loser = game.players.find((p) => p !== winner);
+
+                getUser(winner, (winnerUser) => {
+                    const winnerNew = winnerUser.diamonds + game.prize;
+                    updateUser(winner, { diamonds: winnerNew }, () => {
+                        getUser(loser, (loserUser) => {
+                            ctx.reply(
+                                `🏆 نتیجه‌ی بازی\n\n🥇 برنده: ${winner}\n🥈 بازنده: ${loser}\n🎁 جایزه: ${game.prize} 💎`,
+                                {
+                                    reply_markup: {
+                                        inline_keyboard: [
+                                            [{ text: `💰 موجودی برنده: ${winnerNew}`, callback_data: 'dummy' }],
+                                            [{ text: `💰 موجودی بازنده: ${loserUser.diamonds}`, callback_data: 'dummy' }]
+                                        ]
+                                    }
+                                }
+                            );
+                            delete games[gameId];
+                        });
+                    });
+                });
+            }, 3000);
+        });
+    });
+});
+
+bot.action(/^cancel_([\w]+)$/, (ctx) => {
+    const gameId = ctx.match[1];
+    const userId = ctx.from.id;
+    const game = games[gameId];
+
+    if (!game) return ctx.answerCbQuery('❌ این بازی وجود نداره.', { show_alert: true });
+    if (game.creator !== userId) return ctx.answerCbQuery('❌ فقط سازنده می‌تونه لغو کنه.', { show_alert: true });
+
+    getUser(userId, (user) => {
+        updateUser(userId, { diamonds: user.diamonds + game.amount }, () => {
+            delete games[gameId];
+            ctx.editMessageText('❌ بازی لغو شد.').catch(() => {});
+        });
+    });
+});
+
+// ------------------------------
+// بازی با ربات
+// ------------------------------
+bot.hears(/^بازی (\d+) با ربات$/, (ctx) => {
+    const userId = ctx.from.id;
+    const amount = parseInt(ctx.match[1]);
+
+    if (ctx.chat.type === 'private') return ctx.reply('❌ بازی فقط داخل گروه انجام می‌شه.');
+    if (amount < MIN_BET) return ctx.reply(`❌ حداقل شرط ${MIN_BET} الماسه.`);
+
+    getUser(userId, (user) => {
+        if (user.diamonds < amount) return ctx.reply(`❌ الماس کافی نداری. موجودی: ${user.diamonds}`);
+
+        const gameId = `${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+        games[gameId] = { creator: 'bot', amount, prize: amount * 2, players: ['bot'], status: 'waiting' };
+
+        updateUser(userId, { diamonds: user.diamonds - amount }, () => {
+            ctx.reply(
+                `🏆 بازی با ربات\n\n🤖 بازیکن اول: ربات\n🎁 جایزه‌ی برنده: ${amount * 2} 💎\n\nبرای پیوستن دکمه رو بزن:`,
+                { reply_markup: { inline_keyboard: [[{ text: '➕ پیوستن', callback_data: `joinbot_${gameId}_${userId}` }]] } }
+            );
+        });
+    });
+});
+
+bot.action(/^joinbot_([\w]+)_(\d+)$/, (ctx) => {
+    const gameId = ctx.match[1];
+    const expectedUserId = parseInt(ctx.match[2]);
+    const userId = ctx.from.id;
+    const game = games[gameId];
+
+    if (!game) return ctx.answerCbQuery('❌ این بازی وجود نداره.', { show_alert: true });
+    if (game.status !== 'waiting') return ctx.answerCbQuery('❌ بازی تموم شده.', { show_alert: true });
+    if (userId !== expectedUserId) return ctx.answerCbQuery('❌ این بازی برای تو نیست.', { show_alert: true });
+
+    game.players.push(userId);
+    game.status = 'complete';
+
+    ctx.editMessageText(`🏆 بازی با ربات\n\n🤖 ربات در برابر: ${userId}\n\n🔄 در حال مشخص شدن برنده...`).catch(() => {});
+
+    setTimeout(() => {
+        const winner = game.players[Math.floor(Math.random() * game.players.length)];
+
+        if (winner === 'bot') {
+            ctx.reply(
+                `🏆 نتیجه\n\n🤖 برنده: ربات\n😅 بازنده: ${userId}`,
+                { reply_markup: { inline_keyboard: [[{ text: 'این بار ربات برد! دفعه‌ی بعد بهتر می‌شی 🍀', callback_data: 'dummy' }]] } }
+            );
+        } else {
+            getUser(userId, (winnerUser) => {
+                const winnerNew = winnerUser.diamonds + game.prize;
+                updateUser(userId, { diamonds: winnerNew }, () => {
+                    ctx.reply(
+                        `🏆 نتیجه\n\n🥇 برنده: ${userId}\n🤖 بازنده: ربات\n🎁 جایزه: ${game.prize} 💎`,
+                        { reply_markup: { inline_keyboard: [[{ text: `💰 موجودی جدیدت: ${winnerNew}`, callback_data: 'dummy' }]] } }
+                    );
+                });
+            });
+        }
+        delete games[gameId];
+    }, 3000);
+});
+
+// ------------------------------
+// موجودی سریع داخل گروه
+// ------------------------------
+bot.hears('موجودی من', (ctx) => {
+    getUser(ctx.from.id, (user) => {
+        ctx.reply(`💎 موجودی شما: ${user.diamonds}`);
+    });
+});
+
+// ------------------------------
+// انتقال الماس (با ریپلای)
+// ------------------------------
+bot.hears(/^انتقال (\d+)$/, (ctx) => {
+    const userId = ctx.from.id;
+    const amount = parseInt(ctx.match[1]);
+    const reply = ctx.message.reply_to_message;
+
+    if (!reply) return ctx.reply('❌ باید روی پیام کاربر گیرنده ریپلای کنی.');
+    const targetUserId = reply.from.id;
+    if (targetUserId === userId) return ctx.reply('❌ نمی‌تونی به خودت انتقال بدی.');
+    if (amount <= 0) return ctx.reply('❌ مقدار نامعتبره.');
+
+    getUser(userId, (sender) => {
+        if (sender.diamonds < amount) return ctx.reply(`❌ خودت الماس کافی نداری. موجودی: ${sender.diamonds}`);
+
+        updateUser(userId, { diamonds: sender.diamonds - amount }, () => {
+            getUser(targetUserId, (receiver) => {
+                const receiverNew = receiver.diamonds + amount;
+                updateUser(targetUserId, { diamonds: receiverNew }, () => {
+                    ctx.reply(
+                        `🔄 انتقال الماس\n\n💎 مقدار: ${amount}\n👤 فرستنده: ${userId}\n👤 گیرنده: ${targetUserId}`,
+                        {
+                            reply_markup: {
+                                inline_keyboard: [
+                                    [{ text: `💰 موجودی فرستنده: ${sender.diamonds - amount}`, callback_data: 'dummy' }],
+                                    [{ text: `💰 موجودی گیرنده: ${receiverNew}`, callback_data: 'dummy' }]
+                                ]
+                            }
+                        }
+                    );
+                });
+            });
+        });
+    });
+});
+
+// ------------------------------
+// بازی دوز (Tic-Tac-Toe) دو نفره با شرط الماس
+// ------------------------------
+const dozGames = {};
+const DOZ_MIN_BET = 20;
+
+const WIN_PATTERNS = [
+    [0, 1, 2], [3, 4, 5], [6, 7, 8], // سطرها
+    [0, 3, 6], [1, 4, 7], [2, 5, 8], // ستون‌ها
+    [0, 4, 8], [2, 4, 6]             // قطرها
+];
+
+function cellSymbol(cell) {
+    if (cell === 'red') return '🔴';
+    if (cell === 'blue') return '🔵';
+    return '•';
+}
+
+function boardKeyboard(gameId, board) {
+    const rows = [];
+    for (let r = 0; r < 3; r++) {
+        const row = [];
+        for (let c = 0; c < 3; c++) {
+            const idx = r * 3 + c;
+            row.push({ text: cellSymbol(board[idx]), callback_data: `doz_move_${gameId}_${idx}` });
+        }
+        rows.push(row);
+    }
+    return rows;
+}
+
+function dozWaitingText(amount) {
+    return `⭕ بازی دوز\n\nمقدار الماس\n${amount}\n\nمقدار جایزه\n${amount * 2}\n\nبرای شروع دکمه پیوستن رو بزن`;
+}
+
+function dozBoardText(game) {
+    const turnSymbol = cellSymbol(game.turn);
+    return (
+        `⭕ شروع بازی دوز\n\n` +
+        `کاربر 🔴\n${game.colors.red}\n\n` +
+        `کاربر 🔵\n${game.colors.blue}\n\n` +
+        `نوبت ${turnSymbol}`
+    );
+}
+
+bot.hears(/^دوز (\d+)$/, (ctx) => {
+    const userId = ctx.from.id;
+    const amount = parseInt(ctx.match[1]);
+
+    if (ctx.chat.type === 'private') return ctx.reply('❌ بازی دوز فقط داخل گروه انجام می‌شه.');
+    if (amount < DOZ_MIN_BET) return ctx.reply(`❌ حداقل شرط برای دوز ${DOZ_MIN_BET} الماسه.`);
+
+    getUser(userId, (user) => {
+        if (user.diamonds < amount) return ctx.reply(`❌ الماس کافی نداری. موجودی: ${user.diamonds}`);
+
+        updateUser(userId, { diamonds: user.diamonds - amount }, () => {
+            const gameId = `${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+            dozGames[gameId] = {
+                creator: userId,
+                amount,
+                prize: amount * 2,
+                status: 'waiting',
+                board: Array(9).fill(null),
+                colors: {},
+                turn: null
+            };
+
+            ctx.reply(dozWaitingText(amount), {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '❌ لغو بازی', callback_data: `doz_cancel_${gameId}` }],
+                        [{ text: '➕ پیوستن', callback_data: `doz_join_${gameId}` }]
+                    ]
+                }
+            });
+        });
+    });
+});
+
+bot.action(/^doz_cancel_([\w]+)$/, (ctx) => {
+    const gameId = ctx.match[1];
+    const userId = ctx.from.id;
+    const game = dozGames[gameId];
+
+    if (!game) return ctx.answerCbQuery('❌ این بازی وجود نداره.', { show_alert: true });
+    if (game.creator !== userId) return ctx.answerCbQuery('❌ فقط سازنده می‌تونه لغو کنه.', { show_alert: true });
+    if (game.status !== 'waiting') return ctx.answerCbQuery('❌ بازی شروع شده، دیگه نمیشه لغوش کرد.', { show_alert: true });
+
+    getUser(userId, (user) => {
+        updateUser(userId, { diamonds: user.diamonds + game.amount }, () => {
+            delete dozGames[gameId];
+            ctx.editMessageText('❌ بازی دوز لغو شد.').catch(() => {});
+        });
+    });
+});
+
+bot.action(/^doz_join_([\w]+)$/, (ctx) => {
+    const gameId = ctx.match[1];
+    const userId = ctx.from.id;
+    const game = dozGames[gameId];
+
+    if (!game) return ctx.answerCbQuery('❌ این بازی وجود نداره.', { show_alert: true });
+    if (game.status !== 'waiting') return ctx.answerCbQuery('❌ بازی پر شده یا شروع شده.', { show_alert: true });
+    if (game.creator === userId) return ctx.answerCbQuery('❌ نمی‌تونی به بازی خودت بپیوندی.', { show_alert: true });
+
+    getUser(userId, (user) => {
+        if (user.diamonds < game.amount) {
+            return ctx.answerCbQuery(`❌ الماس کافی نداری. موجودی: ${user.diamonds}`, { show_alert: true });
+        }
+
+        updateUser(userId, { diamonds: user.diamonds - game.amount }, () => {
+            // تخصیص تصادفی رنگ‌ها و نوبت اول
+            const players = [game.creator, userId];
+            const firstIdx = Math.floor(Math.random() * 2);
+            const redUser = players[firstIdx];
+            const blueUser = players[1 - firstIdx];
+
+            game.colors = { red: redUser, blue: blueUser };
+            game.turn = 'red';
+            game.status = 'playing';
+
+            ctx.editMessageText(dozBoardText(game), {
+                reply_markup: { inline_keyboard: boardKeyboard(gameId, game.board) }
+            }).catch(() => {});
+        });
+    });
+});
+
+bot.action(/^doz_move_([\w]+)_(\d)$/, (ctx) => {
+    const gameId = ctx.match[1];
+    const idx = parseInt(ctx.match[2]);
+    const userId = ctx.from.id;
+    const game = dozGames[gameId];
+
+    if (!game || game.status !== 'playing') return ctx.answerCbQuery('❌ این بازی فعال نیست.', { show_alert: true });
+
+    const currentColorUser = game.colors[game.turn];
+    if (userId !== currentColorUser) return ctx.answerCbQuery('❌ نوبت تو نیست.', { show_alert: true });
+    if (game.board[idx]) return ctx.answerCbQuery('❌ این خونه پره.', { show_alert: true });
+
+    game.board[idx] = game.turn;
+
+    // بررسی برنده
+    const winnerColor = WIN_PATTERNS.find(
+        (p) => game.board[p[0]] && game.board[p[0]] === game.board[p[1]] && game.board[p[1]] === game.board[p[2]]
+    );
+
+    if (winnerColor) {
+        const winnerUser = game.colors[game.board[winnerColor[0]]];
+        const loserColor = game.board[winnerColor[0]] === 'red' ? 'blue' : 'red';
+        const loserUser = game.colors[loserColor];
+
+        game.status = 'finished';
+
+        getUser(winnerUser, (winner) => {
+            const winnerNew = winner.diamonds + game.prize;
+            updateUser(winnerUser, { diamonds: winnerNew }, () => {
+                getUser(loserUser, (loser) => {
+                    ctx.editMessageText(
+                        `🏆 بازی تمام\n\nکاربر برنده\n${winnerUser}\n\nکاربر بازنده\n${loserUser}`,
+                        {
+                            reply_markup: {
+                                inline_keyboard: [
+                                    [{ text: `🎁 مقدار جایزه: ${game.prize}`, callback_data: 'dummy' }],
+                                    [{ text: `💰 موجودی برنده: ${winnerNew}`, callback_data: 'dummy' }],
+                                    [{ text: `💰 موجودی بازنده: ${loser.diamonds}`, callback_data: 'dummy' }]
+                                ]
+                            }
+                        }
+                    ).catch(() => {});
+                    delete dozGames[gameId];
+                });
+            });
+        });
+        return;
+    }
+
+    // بررسی پر شدن تخته بدون برنده → ریست تخته و ادامه‌ی بازی
+    const isFull = game.board.every((c) => c !== null);
+    if (isFull) {
+        game.board = Array(9).fill(null);
+    }
+
+    // تعویض نوبت
+    game.turn = game.turn === 'red' ? 'blue' : 'red';
+
+    ctx.editMessageText(dozBoardText(game), {
+        reply_markup: { inline_keyboard: boardKeyboard(gameId, game.board) }
+    }).catch(() => {});
+});
+
+// ------------------------------
+// اجرا
+// ------------------------------
+bot.launch();
+console.log('ربات با موفقیت اجرا شد ✅');
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
