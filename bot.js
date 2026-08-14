@@ -9,7 +9,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const path = require('path');
 
-const TOKEN = process.env.BOT_TOKEN || 'PUT_YOUR_TOKEN_HERE';
+const TOKEN = process.env.BOT_TOKEN || '8955378151:AAGxpTcLJ2yghxIw9yDo4dsbPmDcaSqHqHg';
 const ADMIN_IDS = [8955378151, 8800727588];
 
 const DATA_FILE = path.join(__dirname, 'data.json');
